@@ -14,6 +14,7 @@ using osu.Framework.Audio;
 using osu.Framework.Audio.Track;
 using osu.Framework.Extensions;
 using osu.Framework.IO.Stores;
+using osu.Framework.Logging;
 using osu.Framework.Platform;
 using osu.Game.Beatmaps.Formats;
 using osu.Game.Database;
@@ -44,6 +45,10 @@ namespace osu.Game.Beatmaps
         private readonly BeatmapExporter beatmapExporter;
 
         private readonly LegacyBeatmapExporter legacyBeatmapExporter;
+
+        private readonly Queue<Task> operations = new Queue<Task>();
+
+        private CancellationTokenSource operationCancellationTokenSource = new CancellationTokenSource();
 
         public ProcessBeatmapDelegate? ProcessBeatmap { private get; set; }
 
@@ -301,8 +306,16 @@ namespace osu.Game.Beatmaps
         /// <param name="beatmapInfo">The <see cref="BeatmapInfo"/> to save the content against. The file referenced by <see cref="BeatmapInfo.Path"/> will be replaced.</param>
         /// <param name="beatmapContent">The <see cref="IBeatmap"/> content to write.</param>
         /// <param name="beatmapSkin">The beatmap <see cref="ISkin"/> content to write, null if to be omitted.</param>
-        public virtual void Save(BeatmapInfo beatmapInfo, IBeatmap beatmapContent, ISkin? beatmapSkin = null) =>
-            save(beatmapInfo, beatmapContent, beatmapSkin, transferCollections: true);
+        public virtual void Save(BeatmapInfo beatmapInfo, IBeatmap beatmapContent, ISkin? beatmapSkin = null)
+        {
+            operationCancellationTokenSource.Cancel();
+            operationCancellationTokenSource = new CancellationTokenSource();
+            operations.Clear();
+
+            // Enqueue the save operation to be called by the catch of the cancelled export.
+            var saveTask = Task.Run(() => save(beatmapInfo, beatmapContent, beatmapSkin, transferCollections: true));
+            operations.Enqueue(saveTask);
+        }
 
         public void DeleteAllVideos()
         {
@@ -417,7 +430,27 @@ namespace osu.Game.Beatmaps
 
         public Task Export(BeatmapSetInfo beatmap) => beatmapExporter.ExportAsync(beatmap.ToLive(Realm));
 
-        public Task ExportLegacy(BeatmapSetInfo beatmap) => legacyBeatmapExporter.ExportAsync(beatmap.ToLive(Realm));
+        public async void ExportLegacy(BeatmapSetInfo beatmap)
+        {
+            var exportTask = Task.Run(async () => await legacyBeatmapExporter.ExportAsync(beatmap.ToLive(Realm), cancellationToken: operationCancellationTokenSource.Token).ConfigureAwait(false));
+            operations.Enqueue(exportTask);
+            try
+            {
+                await Task.WhenAll(operations).ConfigureAwait(false);
+                await operations.Dequeue().ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                // The operation was cancelled by Save
+                Logger.Log("Operation cancelled");
+
+                // Run the enqueued save
+                await operations.Dequeue().ConfigureAwait(false);
+
+                // try to export again
+                ExportLegacy(beatmap);
+            }
+        }
 
         private void updateHashAndMarkDirty(BeatmapSetInfo setInfo)
         {
